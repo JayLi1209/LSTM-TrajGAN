@@ -6,6 +6,9 @@ import tensorflow as tf
 from keras.preprocessing.sequence import pad_sequences
 from model import RL_Enhanced_Transformer_TrajGAN
 from MARC.marc import MARC
+from sklearn.model_selection import train_test_split
+from keras.utils import to_categorical
+
 
 def compute_data_stats():
     """Compute statistics from training data."""
@@ -50,7 +53,7 @@ def compute_data_stats():
     return stats
 
 class EarlyStoppingCallback:
-    def __init__(self, patience=15, min_delta=0.001, monitor='g_loss'):
+    def __init__(self, patience=2, min_delta=0.001, monitor='g_loss'):
         """
         Early stopping callback
         
@@ -84,6 +87,14 @@ class EarlyStoppingCallback:
                 print(f"\nEarly stopping triggered at epoch {epoch}. No improvement in {self.monitor} for {self.patience} epochs.")
 
 def main():
+
+    # Check test data
+    x_test = np.load('data/final_test.npy', allow_pickle=True)
+    print(f"Test data type: {type(x_test)}")
+    print(f"Test data shape: {x_test.shape}")
+    print(f"First element type: {type(x_test[0])}")
+
+
     # Initialize wandb
     wandb.init(
         project="rl-transformer-trajgan",
@@ -93,7 +104,7 @@ def main():
             "epochs": 200,
             "batch_size": 256,
             "latent_dim": 100,
-            "early_stopping_patience": 15
+            "early_stopping_patience": 2
         }
     )
     
@@ -158,28 +169,102 @@ def main():
 
 def train_with_monitoring(model, epochs, batch_size, sample_interval, early_stopping):
     """Train the model with wandb monitoring and early stopping"""
-    # Training data
+
+    def load_and_process_data(csv_path, max_length, vocab_sizes):
+        """Load trajectory data from CSV and process into model-ready format"""
+        df = pd.read_csv(csv_path)
+        trajectories = df.groupby('tid')
+        
+        processed = {
+            'lat_lon': [],
+            'day': [],
+            'hour': [],
+            'category': [],
+            'mask': [],
+        }
+        
+        for tid, group in trajectories:
+            # Original sequence length
+            seq_len = len(group)
+            
+            # Process lat/lon coordinates
+            lat_lon = group[['lat', 'lon']].values.astype('float32')
+            padded_ll = pad_sequences([lat_lon], maxlen=max_length, padding='pre', 
+                                    truncating='post', dtype='float32')[0]
+            
+            # Process categorical features with one-hot encoding
+            def process_feature(values, vocab_size):
+                padded = pad_sequences([values], maxlen=max_length, padding='pre',
+                                    truncating='post', dtype='int32')[0]
+                return to_categorical(padded, num_classes=vocab_size)
+            
+            # Create mask (1 for real points, 0 for padding)
+            mask = np.zeros(max_length, dtype='float32')
+            mask[:seq_len] = 1.0
+            mask = np.expand_dims(mask, axis=-1)
+            # Store processed features
+            processed['mask'].append(mask)
+            processed['lat_lon'].append(padded_ll)
+            processed['category'].append(process_feature(group['category'], vocab_sizes['category']))
+            processed['day'].append(process_feature(group['day'], vocab_sizes['day']))
+            processed['hour'].append(process_feature(group['hour'], vocab_sizes['hour']))
+            # processed['mask'] = np.expand_dims(np.array(processed['mask']), axis=-1)
+
+
+        return [np.array(processed[k]) for k in ['lat_lon', 'day', 'hour', 'category', 'mask']]
+    
+
+    vocab_size = {
+        'lat_lon': 2,
+        'day': 7,
+        'hour': 24,
+        'category': 10, 
+        'mask': 1,
+    }
+    # Load and prepare both datasets
     x_train = np.load('data/final_train.npy', allow_pickle=True)
+    X_test = load_and_process_data('data/test_latlon.csv', model.max_length, vocab_size)
+
     
-    # Padding
+    # Padding (using same max_length for both)
     X_train = [pad_sequences(f, model.max_length, padding='pre', dtype='float64') 
-               for f in x_train]
+              for f in x_train]
+    # X_test = [pad_sequences(f, model.max_length, padding='pre', dtype='float64') 
+    #          for f in x_test]  # Test set
     
+    best_test_utility = -np.inf
+    best_test_privacy = np.inf
+
+
     print(f"Starting training for {epochs} epochs...")
     for epoch in range(epochs):
         # Sample batch
         idx = np.random.randint(0, len(X_train[0]), batch_size)
-        batch = [X[idx] for X in X_train]
+        train_batch = [X[idx] for X in X_train]
+        metrics = model.train_step(train_batch, batch_size)
         
-        # Training step
-        metrics = model.train_step(batch, batch_size)
-        
+        # Evaluation (uses test data)
+        test_idx = np.random.randint(0, len(X_test[0]), batch_size)
+        test_batch = [X[test_idx] for X in X_test]
+
+        # for i in range(0,5):
+        #     print(f"train_batch.shape: {train_batch[i].shape}", i)
+        #     print(f"test_batch.shape: {test_batch[i].shape}", i)
+
         # Extract privacy and utility metrics from the model
-        privacy_metric, utility_metric = extract_privacy_utility_metrics(model, batch)
+        train_priv, train_util = extract_privacy_utility_metrics(model, train_batch)
+        test_priv, test_util = extract_privacy_utility_metrics(model, test_batch)  # New
         
-        # Add privacy and utility metrics
-        metrics['privacy_score'] = privacy_metric
-        metrics['utility_score'] = utility_metric
+
+            # Track best test metrics
+        if test_util > best_test_utility:
+            best_test_utility = test_util
+        if test_priv < best_test_privacy:
+            best_test_privacy = test_priv
+
+        # Evaluation (uses test data)
+        test_idx = np.random.randint(0, len(X_test[0]), batch_size)
+        test_batch = [X[test_idx] for X in X_test]
         
         # Log metrics to wandb
         wandb.log({
@@ -188,15 +273,15 @@ def train_with_monitoring(model, epochs, batch_size, sample_interval, early_stop
             'd_loss_fake': metrics['d_loss_fake'],
             'g_loss': metrics['g_loss'],
             'c_loss': metrics['c_loss'],
-            'privacy_score': metrics['privacy_score'],
-            'utility_score': metrics['utility_score']
+            'privacy_score': best_test_privacy,
+            'utility_score': best_test_utility
         })
         
         # Print progress
         if epoch % 10 == 0:
             print(f"Epoch {epoch}/{epochs}")
             print(f"D_real: {metrics['d_loss_real']:.4f}, D_fake: {metrics['d_loss_fake']:.4f}, G: {metrics['g_loss']:.4f}, C: {metrics['c_loss']:.4f}")
-            print(f"Privacy: {metrics['privacy_score']:.4f}, Utility: {metrics['utility_score']:.4f}")
+            print(f"Privacy: {best_test_privacy:.4f}, Utility: {best_test_utility:.4f}")
         
         # Save checkpoints
         if epoch % sample_interval == 0:
@@ -223,24 +308,31 @@ def extract_privacy_utility_metrics(model, batch):
         # Calculate utility metric first (this should always work)
         # Spatial loss - lower is better
         spatial_loss = tf.reduce_mean(tf.square(gen_trajs[0] - batch[0])).numpy()
+        print("spatial_loss is: ", spatial_loss)
         
         # Temporal loss - lower is better
         temp_day_loss = -tf.reduce_mean(tf.reduce_sum(
             batch[2] * tf.math.log(tf.clip_by_value(gen_trajs[2], 1e-7, 1.0)), 
             axis=-1)).numpy()
         
+        print("temp_day_loss is: ", temp_day_loss)
         temp_hour_loss = -tf.reduce_mean(tf.reduce_sum(
             batch[3] * tf.math.log(tf.clip_by_value(gen_trajs[3], 1e-7, 1.0)), 
             axis=-1)).numpy()
+        
+        print("temp_hour_loss is: ", temp_hour_loss)
         
         # Category loss - lower is better
         cat_loss = -tf.reduce_mean(tf.reduce_sum(
             batch[1] * tf.math.log(tf.clip_by_value(gen_trajs[1], 1e-7, 1.0)), 
             axis=-1)).numpy()
         
+        print("cat_loss is: ", cat_loss)
         # Combine utility components (lower is better, so we use negative)
-        utility_metric = -(spatial_loss + 0.5 * (temp_day_loss + temp_hour_loss) + 0.5 * cat_loss)
+        utility_metric = spatial_loss + 0.5 * (temp_day_loss + temp_hour_loss) + 0.5 * cat_loss
         
+
+        print("utility_metric is: ", utility_metric)
         # Now try to calculate privacy metric (this might fail)
         # Use TUL classifier to estimate identifiability
         # First convert one-hot vectors to indices and ensure they're within valid ranges
@@ -261,10 +353,7 @@ def extract_privacy_utility_metrics(model, batch):
         # Format lat_lon to match MARC's expected input shape
         lat_lon_padded = tf.pad(gen_trajs[0], [[0, 0], [0, 0], [0, 38]])
         
-        # Debug output
-        print(f"Day range: min={tf.reduce_min(day_indices).numpy()}, max={tf.reduce_max(day_indices).numpy()}")
-        print(f"Hour range: min={tf.reduce_min(hour_indices).numpy()}, max={tf.reduce_max(hour_indices).numpy()}")
-        print(f"Category range: min={tf.reduce_min(category_indices).numpy()}, max={tf.reduce_max(category_indices).numpy()}")
+        
         
         # Call TUL classifier with properly clipped indices
         tul_preds = model.tul_classifier([day_indices, hour_indices, category_indices, lat_lon_padded])
@@ -283,6 +372,7 @@ def extract_privacy_utility_metrics(model, batch):
         
         # Average user probability (lower means better privacy)
         privacy_metric = tf.reduce_mean(user_probs).numpy()
+        print("privacy_metric is: ", privacy_metric)
         
     except Exception as e:
         print(f"Error computing privacy metric: {e}")

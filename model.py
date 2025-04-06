@@ -3,7 +3,6 @@ import keras
 import numpy as np
 import random
 from tensorflow.keras import layers
-import tensorflow_probability as tfp
 import os
 import json
 
@@ -11,7 +10,7 @@ random.seed(2020)
 np.random.seed(2020)
 tf.random.set_seed(2020)
 
-from keras.layers import Input, Add, Average, Dense, LSTM, Lambda, TimeDistributed, Concatenate, Embedding, MultiHeadAttention, LayerNormalization, Dropout
+from keras.layers import Input, Dense, LSTM, Lambda, TimeDistributed, Concatenate, Embedding, MultiHeadAttention, LayerNormalization, Dropout
 from keras.initializers import he_uniform
 from keras.regularizers import l1
 
@@ -19,7 +18,7 @@ from keras.models import Sequential, Model
 from keras.optimizers import Adam
 from keras.preprocessing.sequence import pad_sequences
 
-from losses import d_bce_loss, trajLoss, TrajLossLayer, CustomTrajLoss, compute_advantage, compute_returns, compute_trajectory_ratio, compute_entropy_loss
+from losses import CustomTrajLoss, compute_advantage, compute_returns
 
 class TransformerBlock(layers.Layer):
     def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
@@ -80,6 +79,11 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.c1 = 0.5  # value function coefficient (reduced)
         self.c2 = 0.01  # entropy coefficient
         self.ppo_epochs = 4  # Number of PPO epochs per batch
+
+        self.r_adv_ema = tf.Variable(0., trainable=False)  # EMA for reward components
+        self.r_util_ema = tf.Variable(0., trainable=False)
+        self.r_priv_ema = tf.Variable(0., trainable=False)
+        self.ema_alpha = 0.95  # Smoothing factor
         
         # Load or initialize TUL classifier for privacy rewards
         self.tul_classifier = self.load_tul_classifier()
@@ -215,7 +219,7 @@ class RL_Enhanced_Transformer_TrajGAN():
         
         # Output layers
         outputs = []
-        for idx, key in enumerate(self.keys):
+        for _, key in enumerate(self.keys):
             if key == 'mask':
                 output_mask = Lambda(lambda x: x)(mask)
                 outputs.append(output_mask)
@@ -236,7 +240,7 @@ class RL_Enhanced_Transformer_TrajGAN():
         inputs = []
         embeddings = []
         
-        for idx, key in enumerate(self.keys):
+        for _, key in enumerate(self.keys):
             if key == 'mask':
                 continue
             elif key == 'lat_lon':
@@ -324,7 +328,7 @@ class RL_Enhanced_Transformer_TrajGAN():
         noise = Input(shape=(self.latent_dim,), name='input_noise')
         
         # Create inputs in the same order as build_generator
-        for idx, key in enumerate(self.keys):
+        for _, key in enumerate(self.keys):
             if key == 'mask':
                 inputs.append(mask)
                 continue
@@ -356,150 +360,61 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.gen_trajs_symbolic = gen_trajs
 
     def compute_rewards(self, real_trajs, gen_trajs, tul_classifier):
-        """Compute the three-part reward function as described in the paper.
-        
-        Args:
-            real_trajs: Original real trajectories
-            gen_trajs: Generated synthetic trajectories
-            tul_classifier: Pre-trained TUL classifier for privacy evaluation
-        
-        Returns:
-            Combined reward balancing privacy, utility and realism
-        """
-        # Cast inputs to float32 for consistent typing
-        gen_trajs = [tf.cast(tensor, tf.float32) for tensor in gen_trajs]
-        real_trajs = [tf.cast(tensor, tf.float32) for tensor in real_trajs]
-        
-        # Adversarial reward - measures realism based on discriminator output
-        d_pred = self.discriminator.predict(gen_trajs[:4])
-        d_pred = tf.cast(d_pred, tf.float32)
-        # Clip discriminator predictions to avoid extreme log values
-        d_pred = tf.clip_by_value(d_pred, 1e-7, 1.0 - 1e-7)
+        """Simplified reward calculation with core components preserved."""
+        # Adversarial reward
+        d_pred = tf.clip_by_value(self.discriminator(gen_trajs[:4]), 1e-7, 1-1e-7)
         r_adv = tf.math.log(d_pred)
+
+        # Utility reward components
+        spatial_loss = tf.clip_by_value(
+            tf.reduce_mean(tf.square(gen_trajs[0] - real_trajs[0]), [1,2]), 0, 10)
         
-        # Utility preservation reward - measures statistical similarity
-        # Spatial loss - L2 distance between coordinates
-        spatial_loss = tf.reduce_mean(tf.square(gen_trajs[0] - real_trajs[0]), axis=[1, 2])
-        spatial_loss = tf.cast(spatial_loss, tf.float32)
-        # Clip spatial loss to avoid extremely large values
-        spatial_loss = tf.clip_by_value(spatial_loss, 0.0, 10.0)
+        def cross_entropy(y_true, y_pred):
+            y_pred = tf.clip_by_value(y_pred, 1e-7, 1-1e-7)
+            return -tf.reduce_sum(y_true * tf.math.log(y_pred), [1,2])
         
-        # Temporal loss - cross-entropy on temporal distributions (day and hour)
-        # Clip generated values to avoid log(0)
-        gen_trajs_day_clipped = tf.clip_by_value(gen_trajs[2], 1e-7, 1.0 - 1e-7)
-        temp_day_loss = -tf.reduce_sum(real_trajs[2] * tf.math.log(gen_trajs_day_clipped), axis=[1, 2])
-        temp_day_loss = tf.cast(temp_day_loss, tf.float32)
-        temp_day_loss = tf.clip_by_value(temp_day_loss, 0.0, 10.0)
+        temp_loss = cross_entropy(real_trajs[2], gen_trajs[2]) + \
+                    cross_entropy(real_trajs[3], gen_trajs[3])
+        cat_loss = cross_entropy(real_trajs[1], gen_trajs[1])
         
-        gen_trajs_hour_clipped = tf.clip_by_value(gen_trajs[3], 1e-7, 1.0 - 1e-7)
-        temp_hour_loss = -tf.reduce_sum(real_trajs[3] * tf.math.log(gen_trajs_hour_clipped), axis=[1, 2])
-        temp_hour_loss = tf.cast(temp_hour_loss, tf.float32)
-        temp_hour_loss = tf.clip_by_value(temp_hour_loss, 0.0, 10.0)
-        
-        # Categorical loss - cross-entropy on category distributions
-        gen_trajs_cat_clipped = tf.clip_by_value(gen_trajs[1], 1e-7, 1.0 - 1e-7)
-        cat_loss = -tf.reduce_sum(real_trajs[1] * tf.math.log(gen_trajs_cat_clipped), axis=[1, 2])
-        cat_loss = tf.cast(cat_loss, tf.float32)
-        cat_loss = tf.clip_by_value(cat_loss, 0.0, 10.0)
-        
-        # Combine utility components with appropriate weights
-        # Convert Python floats to TensorFlow constants with explicit type
-        beta = tf.constant(1.0, dtype=tf.float32)
-        gamma = tf.constant(0.5, dtype=tf.float32)  # Renamed to avoid clash with class attribute
-        chi = tf.constant(0.5, dtype=tf.float32)
-        
-        r_util = -(beta * spatial_loss + gamma * (temp_day_loss + temp_hour_loss) + chi * cat_loss)
-        
-        # Privacy preservation reward using TUL classifier
-        # Adapt input format for MARC model which expects different dimensions
+        r_util = -(self.beta*spatial_loss + self.gamma*temp_loss + self.chi*cat_loss)
+
+        # Privacy reward (simplified error handling)
         try:
-            batch_size = gen_trajs[0].shape[0]
+            day = tf.argmax(gen_trajs[2], -1)
+            hour = tf.argmax(gen_trajs[3], -1)
+            category = tf.argmax(gen_trajs[1], -1)
+            lat_lon = tf.pad(gen_trajs[0], [[0,0],[0,0],[0,38]])
             
-            # Format inputs for MARC model:
-            # 1. Convert one-hot to indices for day, hour, category
-            # Note: gen_trajs order is [lat_lon, category, day, hour, mask]
-            
-            # Convert one-hot day to indices (batch_size, 144) where each value is 0-6
-            day_indices = tf.cast(tf.argmax(gen_trajs[2], axis=-1), tf.int32)
-            # Clip day values to ensure they're in the valid range [0, 6]
-            day_indices = tf.clip_by_value(day_indices, 0, 6)
-            
-            # Convert one-hot hour to indices (batch_size, 144) where each value is 0-23
-            hour_indices = tf.cast(tf.argmax(gen_trajs[3], axis=-1), tf.int32)
-            # Clip hour values to ensure they're in the valid range [0, 23]
-            hour_indices = tf.clip_by_value(hour_indices, 0, 23)
-            
-            # Convert one-hot category to indices (batch_size, 144) where each value is 0-9
-            category_indices = tf.cast(tf.argmax(gen_trajs[1], axis=-1), tf.int32)
-            # Clip category values to ensure they're in valid range [0, 9]
-            category_indices = tf.clip_by_value(category_indices, 0, 9)
-            
-            # Format lat_lon to match MARC's expected input shape (batch_size, 144, 40)
-            # Since our lat_lon is (batch_size, 144, 2), we'll pad it to 40 dimensions
-            lat_lon_padded = tf.pad(gen_trajs[0], [[0, 0], [0, 0], [0, 38]])
-            
-            print(f"Input shapes - Day: {day_indices.shape}, Hour: {hour_indices.shape}, " +
-                  f"Category: {category_indices.shape}, Lat_lon: {lat_lon_padded.shape}")
-            print(f"Day range: [{tf.reduce_min(day_indices)}, {tf.reduce_max(day_indices)}]")
-            
-            # Call the MARC model with the correctly formatted inputs
-            tul_preds = tul_classifier([day_indices, hour_indices, category_indices, lat_lon_padded])
-            
-            # Extract the probability for the correct user
-            # Get the number of output classes from the TUL model
-            num_users = tul_preds.shape[1]
-            print(f"TUL predictions shape: {tul_preds.shape}")
-            
-            # Generate user indices but make sure they don't exceed the valid range
-            user_indices = np.arange(batch_size) % num_users
-            
-            # Safely gather user probabilities
-            batch_indices = tf.range(batch_size, dtype=tf.int32)
-            indices = tf.stack([batch_indices, tf.cast(user_indices, tf.int32)], axis=1)
-            user_probs = tf.gather_nd(tul_preds, indices)
-            
-            # Negative reward for correct user identification (penalize high probabilities)
-            alpha = tf.constant(1.0, dtype=tf.float32)  # Privacy weight
-            r_priv = -alpha * tf.cast(user_probs, tf.float32)
-            
+            tul_preds = tul_classifier([day, hour, category, lat_lon])
+            user_probs = tf.gather_nd(tul_preds, 
+                tf.stack([tf.range(tf.shape(day)[0]), 
+                tf.argmax(tul_preds, -1)], 1))
+            r_priv = -self.alpha * user_probs
         except Exception as e:
-            print(f"Error computing privacy reward: {e}")
-            import traceback
-            traceback.print_exc()
-            print("Using a placeholder privacy reward instead")
-            # If there's an error with the TUL model, use a placeholder privacy reward
             r_priv = tf.zeros_like(r_adv)
+
+        # Combined reward
+        rewards = (self.w_adv*r_adv + self.w_util*r_util + self.w_priv*r_priv)
+        rewards = (rewards - tf.reduce_mean(rewards)) / (tf.math.reduce_std(rewards) + 1e-8)
+
+        def ema_norm(new_value, ema_var):
+            new_ema = self.ema_alpha * ema_var + (1 - self.ema_alpha) * tf.reduce_mean(new_value)
+            ema_var.assign(new_ema)
+            return new_value / (tf.math.abs(new_ema) + 1e-8)
+
+        r_adv = ema_norm(r_adv, self.r_adv_ema)
+        r_util = ema_norm(r_util, self.r_util_ema) 
+        r_priv = ema_norm(r_priv, self.r_priv_ema)
+
+        # Use sigmoid transformation for bounded rewards
+        combined_rewards = (
+            tf.sigmoid(0.3 * r_adv) +
+            tf.sigmoid(0.5 * r_util) + 
+            tf.sigmoid(0.7 * r_priv)
+        )
         
-        # Combined reward with configurable weights
-        w1 = tf.constant(0.5, dtype=tf.float32)  # Reduced weight for adversarial reward
-        w2 = tf.constant(0.3, dtype=tf.float32)  # Reduced weight for utility reward
-        w3 = tf.constant(0.2, dtype=tf.float32)  # Reduced weight for privacy reward
-        
-        r_adv = tf.cast(r_adv, tf.float32)
-        
-        # Ensure r_adv, r_util, and r_priv have appropriate shapes
-        r_adv = tf.reshape(r_adv, [-1])
-        r_util = tf.reshape(r_util, [-1])
-        r_priv = tf.reshape(r_priv, [-1])
-        
-        # Compute the combined reward
-        combined_rewards = w1 * r_adv + w2 * r_util + w3 * r_priv
-        
-        # Ensure the rewards have shape [batch_size, 1]
-        rewards = tf.reshape(combined_rewards, [batch_size, 1])
-        
-        # Normalize rewards for training stability
-        rewards_mean = tf.reduce_mean(rewards)
-        rewards_std = tf.math.reduce_std(rewards) + 1e-8
-        rewards = (rewards - rewards_mean) / rewards_std
-        
-        # Clip rewards to reasonable range to prevent training instability
-        rewards = tf.clip_by_value(rewards, -5.0, 5.0)
-        
-        # Debug print to check rewards shape and values
-        print(f"Rewards shape: {rewards.shape}, min: {tf.reduce_min(rewards)}, max: {tf.reduce_max(rewards)}, mean: {tf.reduce_mean(rewards)}")
-        
-        return rewards
+        return tf.clip_by_value(combined_rewards, 0.1, 0.9)
 
     def train_step(self, real_trajs, batch_size=256):
         # Generate trajectories
@@ -550,7 +465,7 @@ class RL_Enhanced_Transformer_TrajGAN():
         
         return {"d_loss_real": d_loss_real, "d_loss_fake": d_loss_fake, "g_loss": g_loss, "c_loss": c_loss}
 
-    def train(self, epochs=200, batch_size=256, sample_interval=10):
+    def train(self, epochs=1, batch_size=256, sample_interval=10):
         # Training data
         x_train = np.load('data/final_train.npy', allow_pickle=True)
         self.x_train = x_train
@@ -661,17 +576,12 @@ class RL_Enhanced_Transformer_TrajGAN():
         
         # Convert advantages to numpy and ensure proper type/shape
         try:
-            # First ensure advantages is a tensor with float32 type
-            advantages = tf.cast(advantages, tf.float32)
+            advantages = (advantages - tf.reduce_mean(advantages)) / (tf.math.reduce_std(advantages) + 1e-8)
+            advantages = tf.tanh(advantages)  # Constrain to [-1, 1]
             
-            # Clip advantages to reasonable range before any other operations
-            advantages = tf.clip_by_value(advantages, -10.0, 10.0)
-            
-            # Then convert to numpy and flatten
-            advantages_np = advantages.numpy().flatten()  # Flatten to ensure it's 1D
-            
-            # Scale advantages to be positive (sample_weight should be positive)
-            advantages_np = advantages_np - np.min(advantages_np) + 1e-3
+            # Use rank-based weighting instead of raw values
+            advantages_np = tf.argsort(tf.argsort(advantages)).numpy()
+            advantages_np = advantages_np / np.max(advantages_np)
             
             # Normalize to reasonable values (0 to 1 range)
             if np.max(advantages_np) > 0:
@@ -720,34 +630,31 @@ class RL_Enhanced_Transformer_TrajGAN():
         
         # For each categorical output (category, day, hour), compute ratio
         for i in range(1, 4):  # Categorical outputs
-            # Get probabilities under new policy
-            new_probs = new_predictions[i]
+            min_prob = 1e-5
+            new_probs = tf.clip_by_value(new_probs, min_prob, 1.0-min_prob)
+            old_probs = tf.clip_by_value(old_probs, min_prob, 1.0-min_prob)
             
-            # Get probabilities under old policy
-            old_probs = old_predictions[i]
-            
-            # Compute the ratio of probabilities (with small epsilon to avoid division by zero)
-            point_ratio = new_probs / (old_probs + 1e-10)
-            
-            # Reduce along the category dimension to get per-point ratio
-            point_ratio = tf.reduce_sum(point_ratio, axis=-1, keepdims=True)
-            
-            # Multiply with current ratio
-            ratio = ratio * point_ratio
+            # Use log-space calculation for numerical stability
+            log_ratio = tf.reduce_sum(
+                tf.math.log(new_probs) - tf.math.log(old_probs),
+                axis=[1,2]  # Sum over sequence and categorical dimensions
+            )
         
-        # For continuous outputs (coordinates), use normal distribution likelihood ratio
-        # This is simplified - in practice you'd need proper distribution modeling
-        coord_ratio = tf.exp(-0.5 * tf.reduce_sum(tf.square(new_predictions[0] - old_predictions[0]), axis=-1, keepdims=True))
-        ratio = ratio * coord_ratio
+        return tf.exp(tf.clip_by_value(log_ratio, -0.2, 0.2))
         
-        # Mask out padding
-        mask = new_predictions[4]
-        ratio = ratio * mask
+        # # For continuous outputs (coordinates), use normal distribution likelihood ratio
+        # # This is simplified - in practice you'd need proper distribution modeling
+        # coord_ratio = tf.exp(-0.5 * tf.reduce_sum(tf.square(new_predictions[0] - old_predictions[0]), axis=-1, keepdims=True))
+        # ratio = ratio * coord_ratio
         
-        # Average over the trajectory length
-        ratio = tf.reduce_mean(ratio, axis=1)
+        # # Mask out padding
+        # mask = new_predictions[4]
+        # ratio = ratio * mask
         
-        return ratio
+        # # Average over the trajectory length
+        # ratio = tf.reduce_mean(ratio, axis=1)
+        
+        # return ratio
 
     def load_tul_classifier(self):
         """Load the pre-trained Trajectory-User Linking classifier.
