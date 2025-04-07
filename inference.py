@@ -256,14 +256,9 @@ def run_inference(model_path, output_path):
     return target_file
 
 if __name__ == "__main__":
-    # Check command line arguments
-    if len(sys.argv) < 2:
-        print("Usage: python inference.py <model_weights_path>")
-        print("Example: python inference.py results/generator_20.weights.h5")
-        sys.exit(1)
     
     # Get command line arguments
-    model_path = sys.argv[1]
+    model_path = "results/generator_best.weights.h5"
     output_file = 'results/syn_traj_test.csv'
     target_file = 'data/test_latlon.csv'
     

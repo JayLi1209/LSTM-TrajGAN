@@ -720,24 +720,51 @@ class RL_Enhanced_Transformer_TrajGAN():
             A trained model that predicts user IDs from trajectories.
         """
         try:
-            # Import MARC class and initialize it
-            from MARC.marc import MARC
+            # Create input layers with the same names and shapes as MARC
+            input_day = Input(shape=(144,), dtype='int32', name='input_day')
+            input_hour = Input(shape=(144,), dtype='int32', name='input_hour')
+            input_category = Input(shape=(144,), dtype='int32', name='input_category')
+            input_lat_lon = Input(shape=(144, 40), name='input_lat_lon')
             
-            # Create and initialize the MARC model
-            marc_model = MARC()
-            marc_model.build_model()
+            # Create embeddings like MARC
+            emb_day = Embedding(input_dim=7, output_dim=32)(input_day)
+            emb_hour = Embedding(input_dim=24, output_dim=32)(input_hour)
+            emb_category = Embedding(input_dim=10, output_dim=32)(input_category)
+            
+            # Process lat_lon
+            lat_lon_dense = Dense(32, activation='relu')(input_lat_lon)
+            
+            # Concatenate all embeddings
+            concat = Concatenate(axis=2)([emb_day, emb_hour, emb_category, lat_lon_dense])
+            
+            # LSTM layers for sequence processing
+            lstm1 = LSTM(128, return_sequences=True)(concat)
+            lstm2 = LSTM(64, return_sequences=False)(lstm1)
+            
+            # Dense layers
+            dense1 = Dense(256, activation='relu')(lstm2)
+            dense2 = Dense(128, activation='relu')(dense1)
+            
+            # Output layer - assuming 193 users for classification
+            output = Dense(193, activation='softmax')(dense2)
+            
+            # Create model
+            marc_model = Model(
+                inputs=[input_day, input_hour, input_category, input_lat_lon],
+                outputs=output
+            )
             
             # Load pre-trained weights
             marc_model.load_weights('./MARC/MARC_Weight.h5')
             
-            print("Loaded pre-trained MARC TUL classifier")
+            print("Loaded pre-trained MARC TUL classifier weights")
             return marc_model
             
         except Exception as e:
-            print(f"Error loading MARC model: {e}")
+            print(f"Error loading MARC weights: {e}")
             print("Creating a fallback TUL classifier model")
             
-            # If MARC model loading fails, create a fallback model that matches MARC's input format
+            # If MARC weights loading fails, create a fallback model that matches MARC's input format
             # MARC expects 4 inputs: day, hour, category (all as indices), and lat_lon (with shape 144,40)
             
             # Create input layers with the same names and shapes as MARC
@@ -747,9 +774,9 @@ class RL_Enhanced_Transformer_TrajGAN():
             input_lat_lon = Input(shape=(144, 40), name='input_lat_lon')
             
             # Create embeddings like MARC
-            emb_day = Embedding(input_dim=7, output_dim=32, input_length=144)(input_day)
-            emb_hour = Embedding(input_dim=24, output_dim=32, input_length=144)(input_hour)
-            emb_category = Embedding(input_dim=10, output_dim=32, input_length=144)(input_category)
+            emb_day = Embedding(input_dim=7, output_dim=32)(input_day)
+            emb_hour = Embedding(input_dim=24, output_dim=32)(input_hour)
+            emb_category = Embedding(input_dim=10, output_dim=32)(input_category)
             
             # Process lat_lon
             lat_lon_dense = Dense(32, activation='relu')(input_lat_lon)
@@ -763,8 +790,7 @@ class RL_Enhanced_Transformer_TrajGAN():
             # Dense layers
             dense1 = Dense(128, activation='relu')(lstm_out)
             
-            # Output layer - assuming 100 users for classification
-            # (We'll adjust this if needed based on the actual dataset)
+            # Output layer - assuming 193 users for classification
             output = Dense(193, activation='softmax')(dense1)
             
             # Create model
@@ -781,5 +807,4 @@ class RL_Enhanced_Transformer_TrajGAN():
             
             print("Created fallback TUL classifier model with matching input format")
             
-            # Since the fallback model uses Keras functional API, it already supports __call__
             return fallback_model
