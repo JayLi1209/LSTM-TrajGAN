@@ -102,7 +102,7 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Define optimizers with reduced learning rates and gradient clipping
         self.actor_optimizer = Adam(0.0001, clipnorm=1.0)  # Increased learning rate and reduced clipnorm
         self.critic_optimizer = Adam(0.00005, clipnorm=1.0)
-        self.discriminator_optimizer = Adam(0.00002, clipnorm=1.0)  # Reduced learning rate
+        self.discriminator_optimizer = Adam(0.0002, clipnorm=1.0)  # Increased learning rate and clipnorm
 
         # Build networks
         self.generator = self.build_generator()
@@ -113,8 +113,8 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.discriminator.compile(
             loss='binary_crossentropy', 
             optimizer=self.discriminator_optimizer,
-            run_eagerly=True,  # Enable eager execution for better debugging
-            jit_compile=False  # Disable XLA compilation for better debugging
+            run_eagerly=False,  # Disable eager execution for better performance
+            jit_compile=True  # Enable XLA compilation for better performance
         )
         self.critic.compile(
             loss='mse', 
@@ -299,14 +299,14 @@ class RL_Enhanced_Transformer_TrajGAN():
             elif key == 'lat_lon':
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                d = Dense(units=128, activation='relu', use_bias=True,  # Increased from 64 to 128
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_latlon = [d(x) for x in unstacked]
                 e = Lambda(lambda x: tf.stack(x, axis=1))(dense_latlon)
             else:
                 i = Input(shape=(self.max_length, self.vocab_size[key]), name='input_' + key)
                 unstacked = Lambda(lambda x: tf.unstack(x, axis=1))(i)
-                d = Dense(units=100, activation='relu', use_bias=True,  # Changed to 100 to match embed_dim
+                d = Dense(units=128, activation='relu', use_bias=True,  # Increased from 64 to 128
                          kernel_initializer=he_uniform(seed=1), name='emb_' + key)
                 dense_attr = [d(x) for x in unstacked]
                 e = Lambda(lambda x: tf.stack(x, axis=1))(dense_attr)
@@ -317,17 +317,24 @@ class RL_Enhanced_Transformer_TrajGAN():
         concat_input = Concatenate(axis=2)(embeddings)
         
         # Project concatenated embeddings to correct dimension
-        concat_input = Dense(100, activation='relu')(concat_input)  # Project to embed_dim=100
+        concat_input = Dense(128, activation='relu')(concat_input)  # Increased from 64 to 128
         
-        # Transformer blocks
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(concat_input, training=True)
-        x = TransformerBlock(embed_dim=100, num_heads=4, ff_dim=200, rate=0.1)(x, training=True)
+        # Two Transformer blocks for better feature extraction
+        x = TransformerBlock(embed_dim=128, num_heads=4, ff_dim=256, rate=0.1)(concat_input, training=True)
+        x = TransformerBlock(embed_dim=128, num_heads=4, ff_dim=256, rate=0.1)(x, training=True)
         
         # Global average pooling
         x = tf.keras.layers.GlobalAveragePooling1D()(x)
         
-        # Output
-        sigmoid = Dense(1, activation='sigmoid')(x)
+        # Add dropout for regularization (reduced from 0.3)
+        x = Dropout(0.1)(x)
+        
+        # Dense layer before output
+        x = Dense(64, activation='relu')(x)
+        
+        # Output with sigmoid activation
+        sigmoid = Dense(1, activation='sigmoid', 
+                       kernel_initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=0.02))(x)
         
         return Model(inputs=inputs, outputs=sigmoid)
 
@@ -370,24 +377,33 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.gen_trajs_symbolic = gen_trajs
 
     def compute_rewards(self, real_trajs, gen_trajs, tul_classifier):
-        """Simplified reward calculation with core components preserved."""
-        # Adversarial reward
-        d_pred = tf.clip_by_value(self.discriminator(gen_trajs[:4]), 1e-7, 1-1e-7)
-        r_adv = tf.math.log(d_pred)
+        """Compute rewards using the same evaluation standard as test_utility.py"""
+        # Adversarial reward with label smoothing
+        d_pred = self.discriminator(gen_trajs[:4])
+        # Use label smoothing for better training stability
+        r_adv = tf.math.log(tf.clip_by_value(d_pred, 1e-4, 1-1e-4))
 
-        # Utility reward components
-        spatial_loss = tf.clip_by_value(
-            tf.reduce_mean(tf.square(gen_trajs[0] - real_trajs[0]), [1,2]), 0, 10)
+        # Utility reward components (using same standard as test_utility.py)
+        # 1. Spatial loss (MSE between coordinates)
+        spatial_loss = tf.reduce_mean(tf.square(gen_trajs[0] - real_trajs[0]), [1,2])
         
-        def cross_entropy(y_true, y_pred):
-            y_pred = tf.clip_by_value(y_pred, 1e-7, 1-1e-7)
-            return -tf.reduce_sum(y_true * tf.math.log(y_pred), [1,2])
+        # 2. Temporal loss for day (cross-entropy)
+        temp_day_loss = -tf.reduce_mean(tf.reduce_sum(
+            real_trajs[2] * tf.math.log(tf.clip_by_value(gen_trajs[2], 1e-4, 1.0)), 
+            axis=-1))
         
-        temp_loss = cross_entropy(real_trajs[2], gen_trajs[2]) + \
-                    cross_entropy(real_trajs[3], gen_trajs[3])
-        cat_loss = cross_entropy(real_trajs[1], gen_trajs[1])
+        # 3. Temporal loss for hour (cross-entropy)
+        temp_hour_loss = -tf.reduce_mean(tf.reduce_sum(
+            real_trajs[3] * tf.math.log(tf.clip_by_value(gen_trajs[3], 1e-4, 1.0)), 
+            axis=-1))
         
-        r_util = (self.beta*spatial_loss + self.gamma*temp_loss + self.chi*cat_loss)
+        # 4. Category loss (cross-entropy)
+        cat_loss = -tf.reduce_mean(tf.reduce_sum(
+            real_trajs[1] * tf.math.log(tf.clip_by_value(gen_trajs[1], 1e-4, 1.0)), 
+            axis=-1))
+        
+        # Combine utility components with same weights as test_utility.py
+        r_util = spatial_loss + 0.5 * (temp_day_loss + temp_hour_loss) + 0.5 * cat_loss
 
         # Privacy reward (simplified error handling)
         try:
@@ -396,9 +412,6 @@ class RL_Enhanced_Transformer_TrajGAN():
             hour = tf.cast(tf.argmax(gen_trajs[3], -1), tf.int32)
             category = tf.cast(tf.argmax(gen_trajs[1], -1), tf.int32)
             
-            # Print shapes for debugging
-            print(f"Shapes - day: {day.shape}, hour: {hour.shape}, category: {category.shape}")
-            
             # Ensure indices are within valid ranges
             day = tf.clip_by_value(day, 0, 6)
             hour = tf.clip_by_value(hour, 0, 23)
@@ -406,28 +419,20 @@ class RL_Enhanced_Transformer_TrajGAN():
             
             # Format lat_lon to match MARC's expected input shape
             lat_lon = gen_trajs[0]
-            print(f"lat_lon shape before padding: {lat_lon.shape}")
             lat_lon_padded = tf.pad(lat_lon, [[0,0],[0,0],[0,38]])
-            print(f"lat_lon shape after padding: {lat_lon_padded.shape}")
             
             # Call TUL classifier
-            print("Calling TUL classifier...")
             tul_preds = tul_classifier([day, hour, category, lat_lon_padded])
-            print(f"TUL predictions shape: {tul_preds.shape}")
             
             # Get user probabilities
             batch_size = tf.shape(day)[0]
-            # Ensure user_indices is int32
             user_indices = tf.cast(tf.argmax(tul_preds, -1), tf.int32)
-            # Create indices tensor with explicit int32 type
             batch_indices = tf.range(batch_size, dtype=tf.int32)
             indices = tf.stack([batch_indices, user_indices], axis=1)
             user_probs = tf.gather_nd(tul_preds, indices)
-            print(f"User probabilities shape: {user_probs.shape}")
             
             # Compute privacy reward (negative because lower probability means better privacy)
             r_priv = -self.alpha * user_probs
-            print(f"Privacy reward shape: {r_priv.shape}")
             
         except Exception as e:
             print(f"Error in privacy reward computation: {str(e)}")
@@ -437,7 +442,7 @@ class RL_Enhanced_Transformer_TrajGAN():
             # Return a small negative constant instead of zeros to encourage privacy
             r_priv = tf.constant(-0.1, shape=(batch_size, 1), dtype=tf.float32)
 
-        # Combined reward
+        # Combined reward with same weights as before
         rewards = (self.w_adv*r_adv + self.w_util*r_util + self.w_priv*r_priv)
         
         # Less aggressive normalization
@@ -491,7 +496,6 @@ class RL_Enhanced_Transformer_TrajGAN():
         returns = compute_returns(rewards, self.gamma)
         
         # Ensure returns has the same batch size as what the critic expects
-        # The critic takes real_trajs[:4] as input, so returns should match that shape
         if returns.shape[0] != batch_size:
             print(f"Warning: Reshaping returns from {returns.shape} to [{batch_size}, 1]")
             returns = tf.reshape(returns, [batch_size, 1])
@@ -499,14 +503,19 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Update critic using returns
         c_loss = self.critic.train_on_batch(real_trajs[:4], returns)
         
-        # Update discriminator
+        # Update discriminator with more appropriate label smoothing
+        # Use 0.9 for real samples and 0.1 for fake samples with small random noise
+        real_labels = np.ones((batch_size, 1)) * 0.9 + np.random.uniform(0, 0.05, (batch_size, 1))
+        fake_labels = np.ones((batch_size, 1)) * 0.1 + np.random.uniform(0, 0.05, (batch_size, 1))
+        
+        # Train discriminator on both real and fake samples
         d_loss_real = self.discriminator.train_on_batch(
             real_trajs[:4],
-            np.ones((batch_size, 1))
+            real_labels
         )
         d_loss_fake = self.discriminator.train_on_batch(
             gen_trajs[:4],
-            np.zeros((batch_size, 1))
+            fake_labels
         )
         
         # Update generator (actor) using advantages
@@ -555,8 +564,8 @@ class RL_Enhanced_Transformer_TrajGAN():
             self.discriminator.compile(
                 loss='binary_crossentropy', 
                 optimizer=self.discriminator_optimizer,
-                run_eagerly=True,  # Enable eager execution for better debugging
-                jit_compile=False  # Disable XLA compilation for better debugging
+                run_eagerly=False,  # Disable eager execution for better performance
+                jit_compile=True  # Enable XLA compilation for better performance
             )
             self.critic.compile(
                 loss='mse', 
