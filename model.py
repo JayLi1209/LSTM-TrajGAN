@@ -690,30 +690,28 @@ class RL_Enhanced_Transformer_TrajGAN():
         # For each categorical output (category, day, hour), compute ratio
         for i in range(1, 4):  # Categorical outputs
             min_prob = 1e-5
-            new_probs = tf.clip_by_value(new_probs, min_prob, 1.0-min_prob)
-            old_probs = tf.clip_by_value(old_probs, min_prob, 1.0-min_prob)
+            new_probs = tf.clip_by_value(new_predictions[i], min_prob, 1.0-min_prob)
+            old_probs = tf.clip_by_value(old_predictions[i], min_prob, 1.0-min_prob)
             
             # Use log-space calculation for numerical stability
             log_ratio = tf.reduce_sum(
                 tf.math.log(new_probs) - tf.math.log(old_probs),
                 axis=[1,2]  # Sum over sequence and categorical dimensions
             )
+            ratio = ratio * tf.exp(tf.clip_by_value(log_ratio, -0.2, 0.2))
         
-        return tf.exp(tf.clip_by_value(log_ratio, -0.2, 0.2))
+        # For continuous outputs (coordinates), use normal distribution likelihood ratio
+        coord_ratio = tf.exp(-0.5 * tf.reduce_sum(tf.square(new_predictions[0] - old_predictions[0]), axis=-1, keepdims=True))
+        ratio = ratio * coord_ratio
         
-        # # For continuous outputs (coordinates), use normal distribution likelihood ratio
-        # # This is simplified - in practice you'd need proper distribution modeling
-        # coord_ratio = tf.exp(-0.5 * tf.reduce_sum(tf.square(new_predictions[0] - old_predictions[0]), axis=-1, keepdims=True))
-        # ratio = ratio * coord_ratio
+        # Mask out padding
+        mask = new_predictions[4]
+        ratio = ratio * mask
         
-        # # Mask out padding
-        # mask = new_predictions[4]
-        # ratio = ratio * mask
+        # Average over the trajectory length
+        ratio = tf.reduce_mean(ratio, axis=1)
         
-        # # Average over the trajectory length
-        # ratio = tf.reduce_mean(ratio, axis=1)
-        
-        # return ratio
+        return ratio
 
     def load_tul_classifier(self):
         """Load the pre-trained Trajectory-User Linking classifier.

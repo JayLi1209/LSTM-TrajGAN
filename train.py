@@ -290,6 +290,10 @@ def train_with_monitoring(model, epochs, batch_size, sample_interval, early_stop
             wandb.save(f"results/generator_{epoch}.weights.h5")
             wandb.save(f"results/discriminator_{epoch}.weights.h5")
             wandb.save(f"results/critic_{epoch}.weights.h5")
+            
+            # Save generated trajectories every 10 epochs
+            if epoch % 10 == 0:
+                save_generated_trajectories(model, train_batch, epoch, batch_size)
         
         # Check early stopping
         early_stopping.on_epoch_end(epoch, metrics)
