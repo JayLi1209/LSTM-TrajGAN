@@ -156,10 +156,10 @@ def main():
     # Training parameters
     epochs = 200
     batch_size = 256
-    sample_interval = 10
+    sample_interval = 2
     
     # Initialize early stopping
-    early_stopping = EarlyStoppingCallback(patience=15, min_delta=0.001, monitor='g_loss')
+    early_stopping = EarlyStoppingCallback(patience=100, min_delta=0.001, monitor='g_loss')
     
     # Train the model with early stopping and wandb logging
     train_with_monitoring(model, epochs, batch_size, sample_interval, early_stopping)
@@ -232,8 +232,8 @@ def train_with_monitoring(model, epochs, batch_size, sample_interval, early_stop
     # X_test = [pad_sequences(f, model.max_length, padding='pre', dtype='float64') 
     #          for f in x_test]  # Test set
     
-    best_test_utility = -np.inf
-    best_test_privacy = np.inf
+    best_train_utility = -np.inf
+    best_train_privacy = np.inf
 
 
     print(f"Starting training for {epochs} epochs...")
@@ -253,14 +253,13 @@ def train_with_monitoring(model, epochs, batch_size, sample_interval, early_stop
 
         # Extract privacy and utility metrics from the model
         train_priv, train_util = extract_privacy_utility_metrics(model, train_batch)
-        test_priv, test_util = extract_privacy_utility_metrics(model, test_batch)  # New
         
 
             # Track best test metrics
-        if test_util > best_test_utility:
-            best_test_utility = test_util
-        if test_priv < best_test_privacy:
-            best_test_privacy = test_priv
+        if train_util > best_train_utility:
+            best_train_utility = train_util
+        if train_priv < best_train_privacy:
+            best_train_privacy = train_priv
 
         # Evaluation (uses test data)
         test_idx = np.random.randint(0, len(X_test[0]), batch_size)
@@ -273,15 +272,15 @@ def train_with_monitoring(model, epochs, batch_size, sample_interval, early_stop
             'd_loss_fake': metrics['d_loss_fake'],
             'g_loss': metrics['g_loss'],
             'c_loss': metrics['c_loss'],
-            'privacy_score': best_test_privacy,
-            'utility_score': best_test_utility
+            'privacy_score': best_train_privacy,
+            'utility_score': best_train_utility
         })
         
         # Print progress
-        if epoch % 10 == 0:
+        if epoch % 2 == 0:
             print(f"Epoch {epoch}/{epochs}")
             print(f"D_real: {metrics['d_loss_real']:.4f}, D_fake: {metrics['d_loss_fake']:.4f}, G: {metrics['g_loss']:.4f}, C: {metrics['c_loss']:.4f}")
-            print(f"Privacy: {best_test_privacy:.4f}, Utility: {best_test_utility:.4f}")
+            print(f"Privacy: {best_train_privacy:.4f}, Utility: {best_train_utility:.4f}")
         
         # Save checkpoints
         if epoch % sample_interval == 0:

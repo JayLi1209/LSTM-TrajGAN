@@ -100,18 +100,28 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.alpha = 0.5  # Privacy strength weight (reduced)
         
         # Define optimizers with reduced learning rates and gradient clipping
-        self.actor_optimizer = Adam(0.00001, clipnorm=1.0)  # Reduced from 0.00005
-        self.critic_optimizer = Adam(0.00001, clipnorm=1.0)  # Reduced from 0.00005
-        self.discriminator_optimizer = Adam(0.000005, clipnorm=1.0)  # Reduced from 0.00001
+        self.actor_optimizer = Adam(0.0001, clipnorm=1.0)  # Increased learning rate and reduced clipnorm
+        self.critic_optimizer = Adam(0.00005, clipnorm=1.0)
+        self.discriminator_optimizer = Adam(0.00002, clipnorm=1.0)  # Reduced learning rate
 
         # Build networks
         self.generator = self.build_generator()
         self.critic = self.build_critic()
         self.discriminator = self.build_discriminator()
         
-        # Compile models
-        self.discriminator.compile(loss='binary_crossentropy', optimizer=self.discriminator_optimizer)
-        self.critic.compile(loss='mse', optimizer=self.critic_optimizer)
+        # Compile models with gradient clipping and learning rate schedule
+        self.discriminator.compile(
+            loss='binary_crossentropy', 
+            optimizer=self.discriminator_optimizer,
+            run_eagerly=True,  # Enable eager execution for better debugging
+            jit_compile=False  # Disable XLA compilation for better debugging
+        )
+        self.critic.compile(
+            loss='mse', 
+            optimizer=self.critic_optimizer,
+            run_eagerly=True,  # Enable eager execution for better debugging
+            jit_compile=False  # Disable XLA compilation for better debugging
+        )
         
         # Combined model for training
         self.setup_combined_model()
@@ -377,26 +387,65 @@ class RL_Enhanced_Transformer_TrajGAN():
                     cross_entropy(real_trajs[3], gen_trajs[3])
         cat_loss = cross_entropy(real_trajs[1], gen_trajs[1])
         
-        r_util = -(self.beta*spatial_loss + self.gamma*temp_loss + self.chi*cat_loss)
+        r_util = (self.beta*spatial_loss + self.gamma*temp_loss + self.chi*cat_loss)
 
         # Privacy reward (simplified error handling)
         try:
-            day = tf.argmax(gen_trajs[2], -1)
-            hour = tf.argmax(gen_trajs[3], -1)
-            category = tf.argmax(gen_trajs[1], -1)
-            lat_lon = tf.pad(gen_trajs[0], [[0,0],[0,0],[0,38]])
+            # Convert one-hot vectors to indices and ensure int32 type
+            day = tf.cast(tf.argmax(gen_trajs[2], -1), tf.int32)
+            hour = tf.cast(tf.argmax(gen_trajs[3], -1), tf.int32)
+            category = tf.cast(tf.argmax(gen_trajs[1], -1), tf.int32)
             
-            tul_preds = tul_classifier([day, hour, category, lat_lon])
-            user_probs = tf.gather_nd(tul_preds, 
-                tf.stack([tf.range(tf.shape(day)[0]), 
-                tf.argmax(tul_preds, -1)], 1))
+            # Print shapes for debugging
+            print(f"Shapes - day: {day.shape}, hour: {hour.shape}, category: {category.shape}")
+            
+            # Ensure indices are within valid ranges
+            day = tf.clip_by_value(day, 0, 6)
+            hour = tf.clip_by_value(hour, 0, 23)
+            category = tf.clip_by_value(category, 0, self.vocab_size['category'] - 1)
+            
+            # Format lat_lon to match MARC's expected input shape
+            lat_lon = gen_trajs[0]
+            print(f"lat_lon shape before padding: {lat_lon.shape}")
+            lat_lon_padded = tf.pad(lat_lon, [[0,0],[0,0],[0,38]])
+            print(f"lat_lon shape after padding: {lat_lon_padded.shape}")
+            
+            # Call TUL classifier
+            print("Calling TUL classifier...")
+            tul_preds = tul_classifier([day, hour, category, lat_lon_padded])
+            print(f"TUL predictions shape: {tul_preds.shape}")
+            
+            # Get user probabilities
+            batch_size = tf.shape(day)[0]
+            # Ensure user_indices is int32
+            user_indices = tf.cast(tf.argmax(tul_preds, -1), tf.int32)
+            # Create indices tensor with explicit int32 type
+            batch_indices = tf.range(batch_size, dtype=tf.int32)
+            indices = tf.stack([batch_indices, user_indices], axis=1)
+            user_probs = tf.gather_nd(tul_preds, indices)
+            print(f"User probabilities shape: {user_probs.shape}")
+            
+            # Compute privacy reward (negative because lower probability means better privacy)
             r_priv = -self.alpha * user_probs
+            print(f"Privacy reward shape: {r_priv.shape}")
+            
         except Exception as e:
-            r_priv = tf.zeros_like(r_adv)
+            print(f"Error in privacy reward computation: {str(e)}")
+            print(f"Error type: {type(e)}")
+            import traceback
+            traceback.print_exc()
+            # Return a small negative constant instead of zeros to encourage privacy
+            r_priv = tf.constant(-0.1, shape=(batch_size, 1), dtype=tf.float32)
 
         # Combined reward
         rewards = (self.w_adv*r_adv + self.w_util*r_util + self.w_priv*r_priv)
-        rewards = (rewards - tf.reduce_mean(rewards)) / (tf.math.reduce_std(rewards) + 1e-8)
+        
+        # Less aggressive normalization
+        rewards = rewards / (tf.math.reduce_std(rewards) + 1e-8)
+        
+        # Log reward components for debugging
+        print(f"Reward components - r_adv: {tf.reduce_mean(r_adv):.4f}, r_util: {tf.reduce_mean(r_util):.4f}, r_priv: {tf.reduce_mean(r_priv):.4f}")
+        print(f"Combined rewards - mean: {tf.reduce_mean(rewards):.4f}, std: {tf.math.reduce_std(rewards):.4f}")
 
         def ema_norm(new_value, ema_var):
             new_ema = self.ema_alpha * ema_var + (1 - self.ema_alpha) * tf.reduce_mean(new_value)
@@ -503,8 +552,18 @@ class RL_Enhanced_Transformer_TrajGAN():
             self.discriminator = self.build_discriminator()
             
             # Compile models
-            self.discriminator.compile(loss='binary_crossentropy', optimizer=self.discriminator_optimizer)
-            self.critic.compile(loss='mse', optimizer=self.critic_optimizer)
+            self.discriminator.compile(
+                loss='binary_crossentropy', 
+                optimizer=self.discriminator_optimizer,
+                run_eagerly=True,  # Enable eager execution for better debugging
+                jit_compile=False  # Disable XLA compilation for better debugging
+            )
+            self.critic.compile(
+                loss='mse', 
+                optimizer=self.critic_optimizer,
+                run_eagerly=True,  # Enable eager execution for better debugging
+                jit_compile=False  # Disable XLA compilation for better debugging
+            )
             
             self.setup_combined_model()
             
@@ -574,36 +633,36 @@ class RL_Enhanced_Transformer_TrajGAN():
         # Use ones as targets for the discriminator output (we want to fool the discriminator)
         targets = np.ones((batch_size, 1))
         
-        # Convert advantages to numpy and ensure proper type/shape
+        # Process advantages with less aggressive normalization
         try:
-            advantages = (advantages - tf.reduce_mean(advantages)) / (tf.math.reduce_std(advantages) + 1e-8)
-            advantages = tf.tanh(advantages)  # Constrain to [-1, 1]
+            # Only normalize if advantages have high variance
+            if tf.math.reduce_std(advantages) > 1e-6:
+                advantages = advantages / (tf.math.reduce_std(advantages) + 1e-8)
             
-            # Use rank-based weighting instead of raw values
-            advantages_np = tf.argsort(tf.argsort(advantages)).numpy()
-            advantages_np = advantages_np / np.max(advantages_np)
+            # Use tanh instead of sigmoid for better gradient flow
+            advantages = tf.tanh(advantages)  # Scale to [-1, 1]
             
-            # Normalize to reasonable values (0 to 1 range)
-            if np.max(advantages_np) > 0:
-                advantages_np = advantages_np / np.max(advantages_np)
-                
-            # Ensure it has the right shape
+            # Convert to numpy and ensure proper shape
+            advantages_np = advantages.numpy()
             if len(advantages_np) != batch_size:
                 print(f"Warning: Reshaping advantages from {len(advantages_np)} to {batch_size}")
-                # If shapes don't match, use uniform weights
                 advantages_np = np.ones(batch_size)
-                
-            # Final safety check - replace any NaN or inf values
-            advantages_np = np.nan_to_num(advantages_np, nan=0.5, posinf=1.0, neginf=0.0)
+            
+            # Add small constant to prevent zero weights
+            advantages_np = advantages_np + 0.1
+            
+            # Print advantage statistics
+            print(f"Advantage stats - min: {np.min(advantages_np):.4f}, max: {np.max(advantages_np):.4f}, " +
+                  f"mean: {np.mean(advantages_np):.4f}, std: {np.std(advantages_np):.4f}")
+            
+            # Normalize to sum to batch_size
+            advantages_np = advantages_np * (batch_size / np.sum(advantages_np))
                 
         except Exception as e:
             print(f"Error processing advantages: {e}")
-            # Fallback to uniform weights
-            advantages_np = np.ones(batch_size)
-            
-        # Print statistics about advantage values used for training
-        print(f"Advantage stats - min: {np.min(advantages_np):.4f}, max: {np.max(advantages_np):.4f}, " +
-              f"mean: {np.mean(advantages_np):.4f}, std: {np.std(advantages_np):.4f}")
+            # Fallback to uniform weights with small random noise
+            advantages_np = np.ones(batch_size) + np.random.normal(0, 0.1, batch_size)
+            advantages_np = np.clip(advantages_np, 0.1, 2.0)
         
         # Train the combined model with sample weights from advantages
         loss = self.combined.train_on_batch(

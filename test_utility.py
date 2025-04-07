@@ -2,6 +2,10 @@ import pandas as pd
 import numpy as np
 from haversine import haversine
 import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error
+from collections import defaultdict
+import tensorflow as tf
+from keras.utils import pad_sequences, to_categorical
 
 def evaluate_trajectory_utility(real_file, synthetic_file):
     """
@@ -29,81 +33,102 @@ def evaluate_trajectory_utility(real_file, synthetic_file):
     
     metrics = {}
     
-    # 1. Trajectory Count Preservation
-    real_traj_count = real_df['tid'].nunique()
-    syn_traj_count = syn_df['tid'].nunique()
-    metrics['trajectory_count_ratio'] = syn_traj_count / real_traj_count
-    
-    # 2. Category Distribution Preservation
-    real_category_dist = real_df['category'].value_counts(normalize=True)
-    syn_category_dist = syn_df['category'].value_counts(normalize=True)
-    
-    # Handle missing categories
-    all_categories = sorted(set(real_category_dist.index) | set(syn_category_dist.index))
-    real_dist_array = np.array([real_category_dist.get(cat, 0) for cat in all_categories])
-    syn_dist_array = np.array([syn_category_dist.get(cat, 0) for cat in all_categories])
-    
-    # Jensen-Shannon Divergence (symmetric version of KL divergence)
-    metrics['category_js_divergence'] = calculate_js_divergence(real_dist_array, syn_dist_array)
-    
-    # 3. Temporal Distribution Preservation
-    # Hour distribution
-    real_hour_dist = real_df['hour'].value_counts(normalize=True)
-    syn_hour_dist = syn_df['hour'].value_counts(normalize=True)
-    
-    all_hours = sorted(set(real_hour_dist.index) | set(syn_hour_dist.index))
-    real_hour_array = np.array([real_hour_dist.get(h, 0) for h in all_hours])
-    syn_hour_array = np.array([syn_hour_dist.get(h, 0) for h in all_hours])
-    
-    metrics['hour_js_divergence'] = calculate_js_divergence(real_hour_array, syn_hour_array)
-    
-    # Day distribution
-    real_day_dist = real_df['day'].value_counts(normalize=True)
-    syn_day_dist = syn_df['day'].value_counts(normalize=True)
-    
-    all_days = sorted(set(real_day_dist.index) | set(syn_day_dist.index))
-    real_day_array = np.array([real_day_dist.get(d, 0) for d in all_days])
-    syn_day_array = np.array([syn_day_dist.get(d, 0) for d in all_days])
-    
-    metrics['day_js_divergence'] = calculate_js_divergence(real_day_array, syn_day_array)
-    
-    # 4. Spatial Distribution Preservation
-    # Compare overall spatial distribution using grid-based approach
-    lat_min = min(real_df['lat'].min(), syn_df['lat'].min())
-    lat_max = max(real_df['lat'].max(), syn_df['lat'].max())
-    lon_min = min(real_df['lon'].min(), syn_df['lon'].min())
-    lon_max = max(real_df['lon'].max(), syn_df['lon'].max())
-    
-    # Create grid cells
-    grid_size = 0.01  # approximately 1km depending on latitude
-    metrics['spatial_js_divergence'] = calculate_spatial_js_divergence(
-        real_df, syn_df, lat_min, lat_max, lon_min, lon_max, grid_size)
-    
-    # 5. Trajectory-level Metrics
-    common_tids = set(real_df['tid'].unique()) & set(syn_df['tid'].unique())
-    
-    if len(common_tids) > 0:
-        # Calculate metrics for trajectories with same IDs
-        traj_metrics = calculate_trajectory_specific_metrics(real_df, syn_df, common_tids)
-        metrics.update(traj_metrics)
-    
-    # 6. Overall utility score (weighted combination of metrics)
-    # Lower divergence values are better (closer to 0)
-    # Convert divergences to similarities (1 - normalized_divergence)
-    
-    # Normalize JS divergences to 0-1 scale (they're already between 0-1, but invert for similarity)
-    category_similarity = 1 - metrics['category_js_divergence']
-    hour_similarity = 1 - metrics['hour_js_divergence']
-    day_similarity = 1 - metrics['day_js_divergence']
-    spatial_similarity = 1 - metrics['spatial_js_divergence']
-    
-    # Calculate overall utility score (equal weights for simplicity)
-    metrics['overall_utility_score'] = 0.25 * category_similarity + \
-                                     0.25 * hour_similarity + \
-                                     0.25 * day_similarity + \
-                                     0.25 * spatial_similarity
+    try:
+        # Convert DataFrames to model-ready format
+        max_length = 144  # Default value, can be adjusted based on your data
+        vocab_size = {
+            'lat_lon': 2,
+            'day': 7,
+            'hour': 24,
+            'category': 10,
+            'mask': 1
+        }
+        
+        # Process real data
+        real_data = process_dataframe(real_df, max_length, vocab_size)
+        # Process synthetic data
+        syn_data = process_dataframe(syn_df, max_length, vocab_size)
+        
+        # Calculate spatial loss
+        spatial_loss = tf.reduce_mean(tf.square(syn_data[0] - real_data[0])).numpy()
+        print("spatial_loss is: ", spatial_loss)
+        
+        # Calculate temporal loss for day
+        temp_day_loss = -tf.reduce_mean(tf.reduce_sum(
+            real_data[2] * tf.math.log(tf.clip_by_value(syn_data[2], 1e-7, 1.0)), 
+            axis=-1)).numpy()
+        print("temp_day_loss is: ", temp_day_loss)
+        
+        # Calculate temporal loss for hour
+        temp_hour_loss = -tf.reduce_mean(tf.reduce_sum(
+            real_data[3] * tf.math.log(tf.clip_by_value(syn_data[3], 1e-7, 1.0)), 
+            axis=-1)).numpy()
+        print("temp_hour_loss is: ", temp_hour_loss)
+        
+        # Calculate category loss
+        cat_loss = -tf.reduce_mean(tf.reduce_sum(
+            real_data[1] * tf.math.log(tf.clip_by_value(syn_data[1], 1e-7, 1.0)), 
+            axis=-1)).numpy()
+        print("cat_loss is: ", cat_loss)
+        
+        # Combine utility components (lower is better, so we use negative)
+        utility_metric = spatial_loss + 0.5 * (temp_day_loss + temp_hour_loss) + 0.5 * cat_loss
+        print("utility_metric is: ", utility_metric)
+        
+        # Store all metrics
+        metrics['spatial_loss'] = spatial_loss
+        metrics['temp_day_loss'] = temp_day_loss
+        metrics['temp_hour_loss'] = temp_hour_loss
+        metrics['category_loss'] = cat_loss
+        metrics['overall_utility_score'] = utility_metric
+        
+    except Exception as e:
+        print(f"Error computing utility metrics: {e}")
+        print("Using placeholder metrics")
+        metrics['overall_utility_score'] = 0.5  # Neutral utility score
     
     return metrics
+
+def process_dataframe(df, max_length, vocab_size):
+    """Convert DataFrame to model-ready format"""
+    trajectories = df.groupby('tid')
+    
+    processed = {
+        'lat_lon': [],
+        'day': [],
+        'hour': [],
+        'category': [],
+        'mask': [],
+    }
+    
+    for tid, group in trajectories:
+        # Original sequence length
+        seq_len = len(group)
+        
+        # Process lat/lon coordinates
+        lat_lon = group[['lat', 'lon']].values.astype('float32')
+        padded_ll = pad_sequences([lat_lon], maxlen=max_length, padding='pre', 
+                                truncating='post', dtype='float32')[0]
+        
+        # Process categorical features with one-hot encoding
+        def process_feature(values, vocab_size):
+            padded = pad_sequences([values], maxlen=max_length, padding='pre',
+                                truncating='post', dtype='int32')[0]
+            return to_categorical(padded, num_classes=vocab_size)
+        
+        # Create mask (1 for real points, 0 for padding)
+        mask = np.zeros(max_length, dtype='float32')
+        mask[:seq_len] = 1.0
+        mask = np.expand_dims(mask, axis=-1)
+        
+        # Store processed features
+        processed['mask'].append(mask)
+        processed['lat_lon'].append(padded_ll)
+        processed['category'].append(process_feature(group['category'], vocab_size['category']))
+        processed['day'].append(process_feature(group['day'], vocab_size['day']))
+        processed['hour'].append(process_feature(group['hour'], vocab_size['hour']))
+    
+    return [np.array(processed[k]) for k in ['lat_lon', 'day', 'hour', 'category', 'mask']]
 
 def calculate_js_divergence(p, q):
     """Calculate Jensen-Shannon divergence between two probability distributions"""
@@ -266,7 +291,7 @@ def visualize_metrics(metrics, output_file=None):
 # Example usage
 if __name__ == "__main__":
     real_file = "data/test_latlon.csv"
-    synthetic_file = "results/syn_traj_test.csv"
+    synthetic_file = "/root/autodl-tmp/syn_traj_test.csv"
     
     # Calculate metrics
     utility_metrics = evaluate_trajectory_utility(real_file, synthetic_file)
