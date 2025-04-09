@@ -99,9 +99,9 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.chi = 0.3    # Category loss weight (reduced)
         
         # Define optimizers with reduced learning rates and gradient clipping
-        self.actor_optimizer = Adam(0.0001, clipnorm=1.0)  # Increased learning rate and reduced clipnorm
-        self.critic_optimizer = Adam(0.00005, clipnorm=1.0)
-        self.discriminator_optimizer = Adam(0.00002, clipnorm=1.0)  # Reduced learning rate
+        self.actor_optimizer = Adam(0.0001)  # Increased learning rate and reduced clipnorm
+        self.critic_optimizer = Adam(0.0001)
+        self.discriminator_optimizer = Adam(0.0001)  # Reduced learning rate
 
         # Build networks
         self.generator = self.build_generator()
