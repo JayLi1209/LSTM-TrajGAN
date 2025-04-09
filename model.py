@@ -89,15 +89,14 @@ class RL_Enhanced_Transformer_TrajGAN():
         self.tul_classifier = self.load_tul_classifier()
         
         # Define reward weights
-        self.w_adv = 0.5  # Weight for adversarial reward (reduced)
-        self.w_util = 0.5  # Weight for utility reward (reduced)
-        self.w_priv = 0.5  # Weight for privacy reward (reduced)
+        self.w_adv = 0.4  # Weight for adversarial reward (reduced)
+        self.w_util = 0.3  # Weight for utility reward (reduced)
+        self.w_priv = 0.3  # Weight for privacy reward (reduced)
         
         # Define utility component weights
         self.beta = 0.5   # Spatial loss weight (reduced)
         self.gamma = 0.2  # Temporal loss weight (reduced)
-        self.chi = 0.2    # Category loss weight (reduced)
-        self.alpha = 0.5  # Privacy strength weight (reduced)
+        self.chi = 0.3    # Category loss weight (reduced)
         
         # Define optimizers with reduced learning rates and gradient clipping
         self.actor_optimizer = Adam(0.0001, clipnorm=1.0)  # Increased learning rate and reduced clipnorm
@@ -426,7 +425,7 @@ class RL_Enhanced_Transformer_TrajGAN():
             print(f"User probabilities shape: {user_probs.shape}")
             
             # Compute privacy reward (negative because lower probability means better privacy)
-            r_priv = -self.alpha * user_probs
+            r_priv = -user_probs
             print(f"Privacy reward shape: {r_priv.shape}")
             
         except Exception as e:
