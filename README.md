@@ -49,10 +49,10 @@ The RL-Transformer-GAN combines three powerful deep learning paradigms:
 python train.py
 ```
 
-### Inference
+### Inference (test data generater)
 
 ```bash
-python inference.py results/generator_best.weights.h5
+python inference.py
 ```
 
 ### Evaluation
