@@ -1,5 +1,8 @@
-venv/
-wandb/
-__pycache__/
-results/
 .DS_Store/
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
